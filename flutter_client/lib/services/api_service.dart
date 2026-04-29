@@ -3,8 +3,9 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
 class ApiService {
-  // Use 10.0.2.2 for Android emulator to hit localhost, or your actual local IP
-  static const String baseUrl = 'http://10.0.2.2:3000';
+  // Physical device on the same WiFi/hotspot as your PC
+  // Android emulator → use 10.0.2.2:3000 instead
+  static const String baseUrl = 'http://172.20.10.2:3000';
 
   static Future<String?> getToken() async {
     final prefs = await SharedPreferences.getInstance();
@@ -51,12 +52,34 @@ class ApiService {
     }
   }
 
+  static Future<Map<String, dynamic>> getPatientFHIR(String abhaId) async {
+    final response = await http.get(Uri.parse('$baseUrl/patient/$abhaId'));
+    if (response.statusCode == 200) {
+      return jsonDecode(response.body);
+    } else {
+      throw Exception('Failed to fetch patient FHIR data: ${response.body}');
+    }
+  }
+
   static Future<Map<String, dynamic>> getTimeline(String abhaId) async {
     final response = await http.get(Uri.parse('$baseUrl/patient/$abhaId/timeline'));
     if (response.statusCode == 200) {
       return jsonDecode(response.body);
     } else {
       throw Exception('Failed to fetch timeline: ${response.body}');
+    }
+  }
+
+  static Future<Map<String, dynamic>> searchTimeline(String abhaId, String query) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/patient/$abhaId/search'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'query': query}),
+    );
+    if (response.statusCode == 200) {
+      return jsonDecode(response.body);
+    } else {
+      throw Exception('Failed to search timeline: ${response.body}');
     }
   }
 

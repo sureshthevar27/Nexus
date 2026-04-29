@@ -2,7 +2,7 @@ const express = require('express');
 const crypto = require('crypto');
 const qrcode = require('qrcode');
 const db = require('../db/sqlite');
-const { mapToFHIR, mapReportToFHIR } = require('../services/openai-mapper');
+const { mapToFHIR, mapReportToFHIR, searchTimeline, generateClinicalSummary } = require('../services/openai-mapper');
 
 const router = express.Router();
 
@@ -45,12 +45,49 @@ const generateOtp = () => '123456';
 
 router.get('/patient/:id', async (req, res) => {
   try {
-    const row = await getRow('SELECT raw_json FROM patients WHERE abha_id = ?', [req.params.id]);
-    if (!row) return res.status(404).json({ error: 'Patient not found' });
+    // Multi-Hospital Retrieval: Query both decentralized nodes concurrently
+    const [apolloRow, maxRow] = await Promise.all([
+      getRow('SELECT raw_json FROM apollo_hospital_records WHERE abha_id = ?', [req.params.id]),
+      getRow('SELECT raw_json FROM max_hospital_records WHERE abha_id = ?', [req.params.id])
+    ]);
 
-    const rawData = JSON.parse(row.raw_json);
-    const fhirData = await mapToFHIR(rawData);
-    res.json(fhirData);
+    if (!apolloRow && !maxRow) {
+      return res.status(404).json({ error: 'Patient not found in any hospital network' });
+    }
+
+    const rawDataSources = [];
+    if (apolloRow) rawDataSources.push(JSON.parse(apolloRow.raw_json));
+    if (maxRow) rawDataSources.push(JSON.parse(maxRow.raw_json));
+
+    // For the hackathon, we combine visits from multiple hospitals into one unified payload
+    // In reality, FHIR merging is complex, but here we just append arrays
+    let unifiedData = rawDataSources[0];
+    if (rawDataSources.length > 1) {
+      for (let i = 1; i < rawDataSources.length; i++) {
+        const source = rawDataSources[i];
+        if (source.visits) {
+          unifiedData.visits = (unifiedData.visits || []).concat(source.visits);
+        }
+        if (source.patient_visits) {
+          unifiedData.patient_visits = (unifiedData.patient_visits || []).concat(source.patient_visits);
+        }
+        if (source.admission_records) {
+          unifiedData.admission_records = (unifiedData.admission_records || []).concat(source.admission_records);
+        }
+      }
+    }
+
+    const fhirData = await mapToFHIR(unifiedData);
+    
+    // Step 2: Semantic AI Agents (Summarization)
+    const summaryData = await generateClinicalSummary(fhirData);
+    
+    res.json({
+      ...fhirData,
+      ai_insights: {
+        clinical_summary: summaryData.clinical_summary
+      }
+    });
   } catch (error) {
     console.error('Failed to fetch patient:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -64,7 +101,11 @@ router.post('/link-record', async (req, res) => {
       return res.status(400).json({ error: 'abha_id, name, and dob are required' });
     }
 
-    const rows = await getAll('SELECT raw_json FROM patients');
+    const [apolloRows, maxRows] = await Promise.all([
+      getAll('SELECT raw_json FROM apollo_hospital_records'),
+      getAll('SELECT raw_json FROM max_hospital_records')
+    ]);
+    const rows = [...apolloRows, ...maxRows];
     const targetName = normalizeText(name);
     const targetDob = normalizeText(dob);
 
@@ -115,12 +156,15 @@ router.post('/verify-otp', async (req, res) => {
       return res.status(400).json({ error: 'OTP incorrect' });
     }
 
-    const row = await getRow('SELECT raw_json FROM patients WHERE abha_id = ?', [abhaId]);
-    if (!row) return res.status(404).json({ error: 'Patient not found' });
+    const [apolloRow, maxRow] = await Promise.all([
+      getRow('SELECT raw_json FROM apollo_hospital_records WHERE abha_id = ?', [abhaId]),
+      getRow('SELECT raw_json FROM max_hospital_records WHERE abha_id = ?', [abhaId])
+    ]);
+    if (!apolloRow && !maxRow) return res.status(404).json({ error: 'Patient not found' });
 
     otpStore.delete(abhaId);
     const token = crypto.randomUUID();
-    const rawData = JSON.parse(row.raw_json);
+    const rawData = apolloRow ? JSON.parse(apolloRow.raw_json) : JSON.parse(maxRow.raw_json);
 
     res.json({ access_token: token, patient_data: rawData });
   } catch (error) {
@@ -137,7 +181,8 @@ router.post('/share-record', (req, res) => {
     const shareId = crypto.randomUUID();
     shareVault.set(shareId, { data, createdAt: Date.now() });
 
-    res.json({ share_url: `/share/${shareId}` });
+    const shareUrl = `${req.protocol}://${req.get('host')}/share/${shareId}`;
+    res.json({ share_url: shareUrl });
   } catch (error) {
     console.error('Failed to share record:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -171,13 +216,88 @@ router.post('/scan-report', async (req, res) => {
 
 router.get('/patient/:id/timeline', async (req, res) => {
   try {
-    const row = await getRow('SELECT raw_json FROM patients WHERE abha_id = ?', [req.params.id]);
-    if (!row) return res.status(404).json({ error: 'Patient not found' });
+    const [apolloRow, maxRow] = await Promise.all([
+      getRow('SELECT raw_json FROM apollo_hospital_records WHERE abha_id = ?', [req.params.id]),
+      getRow('SELECT raw_json FROM max_hospital_records WHERE abha_id = ?', [req.params.id])
+    ]);
 
-    const rawData = JSON.parse(row.raw_json);
-    res.json({ patient: rawData, sources: ['legacy_db'] });
+    if (!apolloRow && !maxRow) {
+      return res.status(404).json({ error: 'Patient not found' });
+    }
+
+    const rawDataSources = [];
+    if (apolloRow) rawDataSources.push({ ...JSON.parse(apolloRow.raw_json), _source_db: 'Apollo Health DB' });
+    if (maxRow) rawDataSources.push({ ...JSON.parse(maxRow.raw_json), _source_db: 'Max Super Specialty DB' });
+
+    res.json({ patients_data: rawDataSources });
   } catch (error) {
     console.error('Failed to fetch timeline:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.post('/patient/:id/search', async (req, res) => {
+  try {
+    const { query } = req.body || {};
+    if (!query) return res.status(400).json({ error: 'query is required' });
+
+    const [apolloRow, maxRow] = await Promise.all([
+      getRow('SELECT raw_json FROM apollo_hospital_records WHERE abha_id = ?', [req.params.id]),
+      getRow('SELECT raw_json FROM max_hospital_records WHERE abha_id = ?', [req.params.id])
+    ]);
+
+    if (!apolloRow && !maxRow) {
+      return res.status(404).json({ error: 'Patient not found' });
+    }
+
+    const rawDataSources = [];
+    if (apolloRow) rawDataSources.push(JSON.parse(apolloRow.raw_json));
+    if (maxRow) rawDataSources.push(JSON.parse(maxRow.raw_json));
+
+    let unifiedData = rawDataSources[0];
+    if (rawDataSources.length > 1) {
+      for (let i = 1; i < rawDataSources.length; i++) {
+        const source = rawDataSources[i];
+        if (source.visits) unifiedData.visits = (unifiedData.visits || []).concat(source.visits);
+        if (source.patient_visits) unifiedData.patient_visits = (unifiedData.patient_visits || []).concat(source.patient_visits);
+        if (source.admission_records) unifiedData.admission_records = (unifiedData.admission_records || []).concat(source.admission_records);
+      }
+    }
+
+    const fhirData = await mapToFHIR(unifiedData);
+    const searchResult = await searchTimeline(fhirData, query);
+    const entries = Array.isArray(fhirData.entry) ? fhirData.entry : [];
+    const matches = Array.isArray(searchResult.matches) ? searchResult.matches : [];
+    const hydratedMatches = matches.map((match) => {
+      let resource = null;
+      if (Number.isInteger(match.entry_index) && entries[match.entry_index]) {
+        resource = entries[match.entry_index].resource || null;
+      } else if (match.resource_id) {
+        const found = entries.find((entry) => entry.resource?.id === match.resource_id);
+        resource = found?.resource || null;
+      }
+
+      const title = match.title
+        || resource?.code?.text
+        || resource?.medicationCodeableConcept?.text
+        || resource?.type?.[0]?.text
+        || resource?.resourceType
+        || 'Record';
+
+      return {
+        ...match,
+        title,
+        resource_type: resource?.resourceType || match.resource_type,
+        resource,
+      };
+    });
+
+    res.json({
+      summary: searchResult.summary,
+      matches: hydratedMatches,
+    });
+  } catch (error) {
+    console.error('Failed to search timeline:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -190,7 +310,7 @@ router.post('/generate-qr', async (req, res) => {
     const shareId = crypto.randomUUID();
     shareVault.set(shareId, { data, createdAt: Date.now() });
 
-    const shareUrl = `/share/${shareId}`;
+    const shareUrl = `${req.protocol}://${req.get('host')}/share/${shareId}`;
     const qrDataUrl = await qrcode.toDataURL(shareUrl);
 
     res.json({ share_url: shareUrl, qr_data_url: qrDataUrl });

@@ -63,8 +63,11 @@ const callOpenAI = async ({ systemPrompt, userContent, supportsJsonMode = true }
   try {
     return JSON.parse(cleaned);
   } catch (_parseErr) {
+    console.error('JSON Parse Error:', _parseErr.message);
+    const fs = require('fs');
+    fs.writeFileSync('failed_openai_response.txt', cleaned);
     throw new Error(
-      `Failed to parse OpenAI response as JSON. Raw content: ${cleaned.slice(0, 300)}`
+      `Failed to parse OpenAI response as JSON. Error: ${_parseErr.message}. Raw content saved to failed_openai_response.txt`
     );
   }
 };
@@ -75,8 +78,10 @@ const callOpenAI = async ({ systemPrompt, userContent, supportsJsonMode = true }
 const mapToFHIR = async (messyData) => {
   const systemPrompt = [
     'You are a medical data translator.',
-    'Convert the input into a valid HL7 FHIR R4 Patient JSON object.',
-    'Include related Observation and Condition resources when present.',
+    'Convert the input into a valid HL7 FHIR R4 Bundle of type "collection".',
+    'Include the primary Patient resource as the first entry.',
+    'You MUST extract all historical data and include them as entries in the bundle. The output MUST have this structure: {"resourceType": "Bundle", "type": "collection", "entry": [ {"resource": { "resourceType": "Patient", ... } }, {"resource": { "resourceType": "Encounter", ... } }, {"resource": { "resourceType": "Observation", ... } }, {"resource": { "resourceType": "MedicationStatement", ... } } ]}.',
+    'Extract visits as Encounters, prescriptions as MedicationStatements, vitals and lab reports as Observations, and diagnoses as Conditions.',
     'Return ONLY raw JSON. No markdown, no explanation, no code fences.',
   ].join(' ');
 
@@ -102,4 +107,34 @@ const mapReportToFHIR = async (reportText) => {
   });
 };
 
-module.exports = { mapToFHIR, mapReportToFHIR };
+const searchTimeline = async (fhirBundle, query) => {
+  const systemPrompt = [
+    'You are an AI Clinical Search Agent.',
+    `Analyze the provided patient FHIR record and answer the clinical query: "${query}"`,
+    'Return a JSON object with this structure: {"summary": string, "matches": [{"entry_index": number, "summary": string, "resource_type": string, "title": string}]}.',
+    'Use entry_index to point to the matching resource in the bundle entry array (0-based).',
+    'Each match summary should be a short, patient-friendly sentence for that resource.',
+    'If nothing matches, return an empty matches array and summary "No relevant data found in timeline."',
+    'Return ONLY raw JSON. No markdown, no explanation.'
+  ].join(' ');
+
+  return callOpenAI({
+    systemPrompt,
+    userContent: JSON.stringify(fhirBundle),
+  });
+};
+
+const generateClinicalSummary = async (fhirBundle) => {
+  const systemPrompt = [
+    'You are an AI Clinical Summarization Agent.',
+    'Review the provided patient FHIR record (which may contain data merged from multiple hospitals) and provide a concise, 2-3 sentence executive summary of their overall health status, major chronic conditions, and recent critical events.',
+    'Output a JSON object with a single key "clinical_summary". Return ONLY raw JSON.'
+  ].join(' ');
+
+  return callOpenAI({
+    systemPrompt,
+    userContent: JSON.stringify(fhirBundle),
+  });
+};
+
+module.exports = { mapToFHIR, mapReportToFHIR, searchTimeline, generateClinicalSummary };

@@ -16,7 +16,7 @@ class NexusTheme {
         seedColor: primaryBlue,
         primary: primaryBlue,
         secondary: accentTeal,
-        background: backgroundLight,
+        surface: backgroundLight,
         error: errorRed,
       ),
       scaffoldBackgroundColor: backgroundLight,
@@ -66,7 +66,7 @@ class NexusTheme {
         ),
         labelStyle: TextStyle(color: Colors.grey.shade600),
       ),
-      cardTheme: CardTheme(
+      cardTheme: CardThemeData(
         color: cardWhite,
         elevation: 4,
         shadowColor: Colors.black.withOpacity(0.1),

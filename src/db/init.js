@@ -19,25 +19,48 @@ const get = (sql, params = []) => new Promise((resolve, reject) => {
 });
 
 const initDb = async () => {
+  // Decentralized Multi-Hospital Architecture
+  // Creating tables for two different hospital nodes
   await run(
-    'CREATE TABLE IF NOT EXISTS patients (' +
+    'CREATE TABLE IF NOT EXISTS apollo_hospital_records (' +
       'id INTEGER PRIMARY KEY AUTOINCREMENT,' +
       'abha_id TEXT UNIQUE,' +
-      'hospital_id TEXT,' +
       'raw_json TEXT NOT NULL' +
     ')'
   );
 
-  const countRow = await get('SELECT COUNT(1) AS count FROM patients');
-  if (countRow && countRow.count > 0) return;
+  await run(
+    'CREATE TABLE IF NOT EXISTS max_hospital_records (' +
+      'id INTEGER PRIMARY KEY AUTOINCREMENT,' +
+      'abha_id TEXT UNIQUE,' +
+      'raw_json TEXT NOT NULL' +
+    ')'
+  );
+
+  // Check if populated
+  const countApollo = await get('SELECT COUNT(1) AS count FROM apollo_hospital_records');
+  const countMax = await get('SELECT COUNT(1) AS count FROM max_hospital_records');
+  
+  if ((countApollo && countApollo.count > 0) || (countMax && countMax.count > 0)) {
+    return; // Already populated
+  }
 
   const raw = fs.readFileSync(dataPath, 'utf-8');
   const records = JSON.parse(raw);
 
-  for (const record of records) {
+  // Distribute records to simulate decentralized nodes
+  for (let i = 0; i < records.length; i++) {
+    const record = records[i];
+    const isApollo = i % 2 === 0;
+    const table = isApollo ? 'apollo_hospital_records' : 'max_hospital_records';
+    
+    // Override the mock JSON data to simulate different hospitals
+    record.hospital_name = isApollo ? 'Apollo Hospital' : 'Max Super Specialty Hospital';
+    record.hospital_id = isApollo ? 'HOSP_APOLLO' : 'HOSP_MAX';
+
     await run(
-      'INSERT OR REPLACE INTO patients (abha_id, hospital_id, raw_json) VALUES (?, ?, ?)',
-      [record.abha_id || null, record.hospital_id || null, JSON.stringify(record)]
+      `INSERT OR REPLACE INTO ${table} (abha_id, raw_json) VALUES (?, ?)`,
+      [record.abha_id || null, JSON.stringify(record)]
     );
   }
 };
