@@ -2,12 +2,24 @@ const express = require('express');
 const crypto = require('crypto');
 const qrcode = require('qrcode');
 const db = require('../db/sqlite');
-const { mapToFHIR, mapReportToFHIR, searchTimeline, generateClinicalSummary } = require('../services/openai-mapper');
+const {
+  mapToFHIR,
+  mapReportToFHIR,
+  searchTimeline,
+  generateClinicalSummary,
+  generateAgenticSynthesis,
+  fallbackMapToFHIR,
+} = require('../services/openai-mapper');
+const renderShareHtml = require('../views/shareView');
 
 const router = express.Router();
 
 const shareVault = new Map();
 const otpStore = new Map();
+const fhirCache = new Map();
+const intelligenceCache = new Map();
+const summaryCache = new Map();
+const CACHE_TTL_MS = 5 * 60 * 1000;
 
 const getRow = (sql, params = []) => new Promise((resolve, reject) => {
   db.get(sql, params, (err, row) => {
@@ -43,8 +55,35 @@ const getPhoneFromRecord = (record) => (
 
 const generateOtp = () => '123456';
 
+const getCacheValue = (cache, key) => {
+  const entry = cache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.timestamp > CACHE_TTL_MS) {
+    cache.delete(key);
+    return null;
+  }
+  return entry.value;
+};
+
+const setCacheValue = (cache, key, value) => {
+  cache.set(key, { value, timestamp: Date.now() });
+};
+
+const refreshSummaryCache = async (abhaId, unifiedData, consent = {}) => {
+  const fhirData = await mapToFHIR(unifiedData);
+  const summaryData = await generateClinicalSummary(fhirData, consent);
+  const payload = { clinical_summary: summaryData.clinical_summary };
+  setCacheValue(summaryCache, abhaId, payload);
+  return payload;
+};
+
 router.get('/patient/:id', async (req, res) => {
   try {
+    const cachedFhir = getCacheValue(fhirCache, req.params.id);
+    if (cachedFhir) {
+      return res.json(cachedFhir);
+    }
+
     // Multi-Hospital Retrieval: Query both decentralized nodes concurrently
     const [apolloRow, maxRow] = await Promise.all([
       getRow('SELECT raw_json FROM apollo_hospital_records WHERE abha_id = ?', [req.params.id]),
@@ -81,15 +120,157 @@ router.get('/patient/:id', async (req, res) => {
     
     // Step 2: Semantic AI Agents (Summarization)
     const summaryData = await generateClinicalSummary(fhirData);
-    
-    res.json({
+
+    const payload = {
       ...fhirData,
       ai_insights: {
         clinical_summary: summaryData.clinical_summary
       }
-    });
+    };
+
+    setCacheValue(fhirCache, req.params.id, payload);
+
+    res.json(payload);
   } catch (error) {
     console.error('Failed to fetch patient:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.get('/patient/:id/fast', async (req, res) => {
+  try {
+    const [apolloRow, maxRow] = await Promise.all([
+      getRow('SELECT raw_json FROM apollo_hospital_records WHERE abha_id = ?', [req.params.id]),
+      getRow('SELECT raw_json FROM max_hospital_records WHERE abha_id = ?', [req.params.id])
+    ]);
+
+    if (!apolloRow && !maxRow) {
+      return res.status(404).json({ error: 'Patient not found in any hospital network' });
+    }
+
+    const rawDataSources = [];
+    if (apolloRow) rawDataSources.push(JSON.parse(apolloRow.raw_json));
+    if (maxRow) rawDataSources.push(JSON.parse(maxRow.raw_json));
+
+    let unifiedData = rawDataSources[0];
+    if (rawDataSources.length > 1) {
+      for (let i = 1; i < rawDataSources.length; i++) {
+        const source = rawDataSources[i];
+        if (source.visits) unifiedData.visits = (unifiedData.visits || []).concat(source.visits);
+        if (source.patient_visits) unifiedData.patient_visits = (unifiedData.patient_visits || []).concat(source.patient_visits);
+        if (source.admission_records) unifiedData.admission_records = (unifiedData.admission_records || []).concat(source.admission_records);
+      }
+    }
+
+    const fhirData = fallbackMapToFHIR(unifiedData);
+    res.json(fhirData);
+  } catch (error) {
+    console.error('Failed to fetch patient (fast):', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.post('/patient/:id/summary', async (req, res) => {
+  try {
+    const forceRefresh = req.body?.force_refresh === true;
+    const consent = req.body?.consent || {};
+    const cachedSummary = !forceRefresh ? getCacheValue(summaryCache, req.params.id) : null;
+
+    const [apolloRow, maxRow] = await Promise.all([
+      getRow('SELECT raw_json FROM apollo_hospital_records WHERE abha_id = ?', [req.params.id]),
+      getRow('SELECT raw_json FROM max_hospital_records WHERE abha_id = ?', [req.params.id])
+    ]);
+
+    if (!apolloRow && !maxRow) {
+      return res.status(404).json({ error: 'Patient not found in any hospital network' });
+    }
+
+    const rawDataSources = [];
+    if (apolloRow) rawDataSources.push(JSON.parse(apolloRow.raw_json));
+    if (maxRow) rawDataSources.push(JSON.parse(maxRow.raw_json));
+
+    let unifiedData = rawDataSources[0];
+    if (rawDataSources.length > 1) {
+      for (let i = 1; i < rawDataSources.length; i++) {
+        const source = rawDataSources[i];
+        if (source.visits) unifiedData.visits = (unifiedData.visits || []).concat(source.visits);
+        if (source.patient_visits) unifiedData.patient_visits = (unifiedData.patient_visits || []).concat(source.patient_visits);
+        if (source.admission_records) unifiedData.admission_records = (unifiedData.admission_records || []).concat(source.admission_records);
+      }
+    }
+    if (cachedSummary) {
+      // In background, refresh cache with consent context
+      refreshSummaryCache(req.params.id, unifiedData, consent).catch((error) => {
+        console.error('Failed to refresh summary:', error);
+      });
+      return res.json(cachedSummary);
+    }
+
+    const payload = await refreshSummaryCache(req.params.id, unifiedData, consent);
+    res.json(payload);
+  } catch (error) {
+    console.error('Failed to fetch summary:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.post('/patient/:id/intelligence', async (req, res) => {
+  try {
+    const consent = req.body?.consent || {};
+    const consentFlags = {
+      risk_signals: consent.risk_signals !== false,
+      treatment_patterns: consent.treatment_patterns !== false,
+      clinical_context: consent.clinical_context !== false,
+      consent_status: consent.consent_status !== false,
+    };
+
+    const isRefresh = req.body?.refresh === true;
+    const cachedIntelligence = isRefresh ? null : getCacheValue(intelligenceCache, req.params.id);
+    if (cachedIntelligence) {
+      return res.json({
+        risk_signals: consentFlags.risk_signals ? cachedIntelligence.risk_signals : [],
+        treatment_patterns: consentFlags.treatment_patterns ? cachedIntelligence.treatment_patterns : [],
+        clinical_context: consentFlags.clinical_context ? cachedIntelligence.clinical_context : 'Hidden by consent.',
+        consent_status: consentFlags.consent_status ? cachedIntelligence.consent_status : 'Hidden by consent.',
+      });
+    }
+
+    const [apolloRow, maxRow] = await Promise.all([
+      getRow('SELECT raw_json FROM apollo_hospital_records WHERE abha_id = ?', [req.params.id]),
+      getRow('SELECT raw_json FROM max_hospital_records WHERE abha_id = ?', [req.params.id])
+    ]);
+
+    if (!apolloRow && !maxRow) {
+      return res.status(404).json({ error: 'Patient not found in any hospital network' });
+    }
+
+    const rawDataSources = [];
+    if (apolloRow) rawDataSources.push(JSON.parse(apolloRow.raw_json));
+    if (maxRow) rawDataSources.push(JSON.parse(maxRow.raw_json));
+
+    let unifiedData = rawDataSources[0];
+    if (rawDataSources.length > 1) {
+      for (let i = 1; i < rawDataSources.length; i++) {
+        const source = rawDataSources[i];
+        if (source.visits) unifiedData.visits = (unifiedData.visits || []).concat(source.visits);
+        if (source.patient_visits) unifiedData.patient_visits = (unifiedData.patient_visits || []).concat(source.patient_visits);
+        if (source.admission_records) unifiedData.admission_records = (unifiedData.admission_records || []).concat(source.admission_records);
+      }
+    }
+
+    const fhirData = await mapToFHIR(unifiedData);
+    const intelligence = await generateAgenticSynthesis(fhirData);
+
+    setCacheValue(intelligenceCache, req.params.id, intelligence);
+
+    res.json({
+      risk_signals: consentFlags.risk_signals ? intelligence.risk_signals : [],
+      treatment_patterns: consentFlags.treatment_patterns ? intelligence.treatment_patterns : [],
+      clinical_context: consentFlags.clinical_context ? intelligence.clinical_context : 'Hidden by consent.',
+      consent_status: consentFlags.consent_status ? intelligence.consent_status : 'Hidden by consent.',
+    });
+  } catch (error) {
+    console.error('Failed to generate intelligence:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -192,8 +373,35 @@ router.post('/share-record', (req, res) => {
 router.get('/share/:shareId', (req, res) => {
   try {
     const entry = shareVault.get(req.params.shareId);
-    if (!entry) return res.status(404).json({ error: 'Share not found' });
+    if (!entry) {
+      if (req.accepts('html')) {
+        return res.status(401).send(`
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <style>
+              body { font-family: system-ui, sans-serif; background: #0f172a; color: white; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; text-align: center; }
+              .box { background: rgba(30, 41, 59, 0.8); padding: 2rem; border-radius: 16px; max-width: 400px; border: 1px solid rgba(255,255,255,0.1); }
+              h1 { color: #f43f5e; margin-top: 0; }
+            </style>
+          </head>
+          <body>
+            <div class="box">
+              <h1>Not Authorized</h1>
+              <p>This secure health session has ended or the link is invalid.</p>
+            </div>
+          </body>
+          </html>
+        `);
+      }
+      return res.status(404).json({ error: 'Share not found or session ended' });
+    }
 
+    if (req.accepts('html')) {
+      const html = renderShareHtml(entry.data);
+      return res.send(html);
+    }
     res.json(entry.data);
   } catch (error) {
     console.error('Failed to fetch shared record:', error);
@@ -313,9 +521,21 @@ router.post('/generate-qr', async (req, res) => {
     const shareUrl = `${req.protocol}://${req.get('host')}/share/${shareId}`;
     const qrDataUrl = await qrcode.toDataURL(shareUrl);
 
-    res.json({ share_url: shareUrl, qr_data_url: qrDataUrl });
+    res.json({ share_url: shareUrl, qr_data_url: qrDataUrl, share_id: shareId });
   } catch (error) {
     console.error('Failed to generate QR:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.post('/revoke-share', (req, res) => {
+  try {
+    const { share_id } = req.body || {};
+    if (share_id) {
+      shareVault.delete(share_id);
+    }
+    res.json({ success: true });
+  } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
   }
 });

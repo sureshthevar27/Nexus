@@ -37,13 +37,9 @@ const initDb = async () => {
     ')'
   );
 
-  // Check if populated
-  const countApollo = await get('SELECT COUNT(1) AS count FROM apollo_hospital_records');
-  const countMax = await get('SELECT COUNT(1) AS count FROM max_hospital_records');
-  
-  if ((countApollo && countApollo.count > 0) || (countMax && countMax.count > 0)) {
-    return; // Already populated
-  }
+  // Clear existing records to ensure sync with JSON
+  await run('DELETE FROM apollo_hospital_records');
+  await run('DELETE FROM max_hospital_records');
 
   const raw = fs.readFileSync(dataPath, 'utf-8');
   const records = JSON.parse(raw);
