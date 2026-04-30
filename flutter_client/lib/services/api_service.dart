@@ -6,7 +6,7 @@ import '../models/agentic_synthesis.dart';
 class ApiService {
   // Physical device on the same WiFi/hotspot as your PC
   // Android emulator → use 10.0.2.2:3000 instead
-  static const String baseUrl = 'http://10.199.196.88:3000';
+  static const String baseUrl = 'http://172.20.10.2:3000';
 
   static Future<String?> getToken() async {
     final prefs = await SharedPreferences.getInstance();
