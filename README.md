@@ -76,3 +76,7 @@ flutter run
 ---
 
 **Agentic Health Synthesis** | *Building the Future of Public Health Intelligence.*
+
+---
+
+© 2026 Suresh Thevar. All rights reserved.
